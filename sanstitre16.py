@@ -7,13 +7,13 @@ import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import traceback
-import json
 import time
+import json
 # =========================
 # PATHS
 # =========================
 INPUT_FOLDER  = r"C:\Users\Ghofran MASSAOUDI\Desktop\output_equitable_Correct_stucture"
-OUTPUT_FOLDER = r"C:\Users\Ghofran MASSAOUDI\Desktop\Q-Learnung_NCRO_PE_Based"
+OUTPUT_FOLDER = r"C:\Users\Ghofran MASSAOUDI\Desktop\Q-Learnung_NCRO_HV_Based-test"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # =========================
@@ -506,7 +506,8 @@ def enforce_and_score_one_nurse_CORRECTED(df, nurse_id, patient_sequence, csv_na
     # Service times (scaled)
     s = np.zeros(J + 2)
     for i in range(1, J + 1):
-        s[i] = SERVICE_SCALE * _service_time(df, patient_sequence[i - 1])
+        s[i] = _service_time(df, patient_sequence[i - 1])
+
     
     # Timeline calculation
     a, t, endt, work_n, OT_n, time_viol = _timeline_and_overtime_with_arrival(J, Tn, s, Ln)
@@ -578,23 +579,23 @@ def evaluate_solution_CORRECTED(solution: List[int], df: pd.DataFrame,
     
     # Moderate overtime penalties
     if fam == "c":      
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     elif fam == "r":
-        DN_PER_TIME = 0.5  # Keep moderate for random
+        DN_PER_TIME = 1.0  # Keep moderate for random
     elif fam == "rc":
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     else:               
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     
     # Service scaling (use near-full service times)
     if fam == "c":
-        SERVICE_SCALE = 0.95
+        SERVICE_SCALE = 1.0
     elif fam == "r":
-        SERVICE_SCALE = 0.98  # 98% of actual service time
+        SERVICE_SCALE = 1.0  # 98% of actual service time
     elif fam == "rc":
-        SERVICE_SCALE = 0.96
+        SERVICE_SCALE = 1.0
     else:
-        SERVICE_SCALE = 0.95
+        SERVICE_SCALE = 1.0
     
     # Patient coverage penalty
     penalties_global = 0.0
@@ -1187,26 +1188,45 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
     QL_ALPHA, QL_GAMMA, QL_EPSILON = 0.3, 0.9, 0.8
     prev_action = 0  # start assuming 'wall' was last operator
     op_rewards = {a: [] for a in ACTIONS}
-# --- Tag children with their operator for tracking ---
-    def compute_reward(parents, children, action_label=""):
-        """
-        Reward based on Potential Energy (PE) improvement.
-        Reward = max(0, mean(PE_parents) - mean(PE_children))
-        (Lower PE means better solutions.)
-        """
+    def compute_reward(parents, children):
         if not parents or not children:
             return 0.0
-
-        try:
-            pe_parents = np.mean([p.PE for p in parents])
-            pe_children = np.mean([c.PE for c in children])
-            delta_pe = pe_children - pe_parents
-            reward = max(0.0, -delta_pe)  # positive only when children improved
-
-        except Exception as e:
-            print(f"⚠️ PE reward computation error ({action_label}): {e}")
-            reward = 0.0
-
+    
+        # ---- PE Reward ----
+        pe_gaps = []
+        for c in children:
+            pA, pB = c.parents
+            if pA is not None and pA < len(parents):
+                parent_pe = parents[pA].PE
+            elif pB is not None and pB < len(parents):
+                parent_pe = parents[pB].PE
+            else:
+                continue
+            pe_gaps.append(c.PE - parent_pe)
+    
+        R_PE = 0.0
+        if pe_gaps:
+            best_gap = min(pe_gaps)         # most negative = best improvement
+            R_PE = max(0.0, -best_gap)      # convert to positive reward
+    
+        # ---- HV Reward ----
+        pareto_par = np.array([[p.obj[0], p.obj[1], -p.obj[2]] for p in parents])
+        pareto_child = np.array([[c.obj[0], c.obj[1], -c.obj[2]] for c in children])
+        
+        hv_calc = Hypervolume()
+        pareto_ref = np.vstack([pareto_par, pareto_child])
+        
+        HV_par = hv_calc.hypervolume(pareto_par, pareto_ref, 3)
+        HV_child = hv_calc.hypervolume(pareto_child, pareto_ref, 3)
+    
+        delta_HV = HV_child - HV_par
+        R_HV = max(0.0, delta_HV)
+    
+        # ---- Combine ----
+        w_PE = 0.5
+        w_HV = 0.5
+        reward = w_PE * R_PE + w_HV * R_HV
+    
         return reward
 
 
@@ -1220,7 +1240,7 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
         if random.random() < QL_EPSILON:
             action_idx = random.randint(0, len(ACTIONS) - 1)
         else:
-            action_idx = int(np.argmin(Q_table[state]))
+            action_idx = int(np.argmax(Q_table[state]))
         action = ACTIONS[action_idx]
     
         parents_snapshot = pop[:]
@@ -1381,17 +1401,21 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
         pop_extended = pop + Q
         assign_rank_cd_pe(pop_extended)
         pop = sorted(pop_extended, key=lambda m: (m.Rank, -m.CD))[:POP_SIZE]
-        # ✅ Compute reward using PE difference (children - parents)
-        reward = compute_reward(parents_snapshot, Q, action_label=action)
+        
+        # ✅ Compute reward using the real parents (before generation)
+        reward = compute_reward(parents_snapshot, Q)
         op_rewards[action].append(reward)
         # --- Q-learning update (temporal) ---
         next_state = action_idx
         Q_table[state, action_idx] += QL_ALPHA * (
-            reward + QL_GAMMA * np.min(Q_table[next_state]) - Q_table[state, action_idx]
+            reward + QL_GAMMA * np.max(Q_table[next_state]) - Q_table[state, action_idx]
         )
 
         # --- Move forward in the temporal chain ---
         prev_action = next_state
+
+        # --- Exploration decay ---
+        QL_EPSILON = max(0.01, QL_EPSILON * 0.995)
 
         # --- Simple progress log ---
         if it % 10 == 0:
@@ -1461,9 +1485,6 @@ def assign_rank_cd_pe(pool: List[Molecule]) -> None:
     for i, m in enumerate(pool):
         m.CD = float(CD[i])
         m.PE = float(m.Rank + math.exp(-max(0.0, m.CD)))
-# =========================
-# SMART 5-INSTANCE TEST EXECUTION
-# =========================
 NUM_RUNS = 10   # ← Change to 10 if you want 10 runs
 CHECKPOINT_FILE = Path(OUTPUT_FOLDER) / "ncro_checkpoint.json"
 
@@ -1495,7 +1516,8 @@ if __name__ == "__main__":
     all_files = sorted(Path(INPUT_FOLDER).glob("*.csv"))
 
     # 🔍 Run only the first instance (e.g., c101)
-    all_files = all_files[:1]
+    all_files = all_files[:1]  # this keeps only the first CSV file found
+
     if not all_files:
         print("⚠️ No CSV files found in INPUT_FOLDER.")
         raise SystemExit
@@ -1572,3 +1594,4 @@ if __name__ == "__main__":
 
     print("\n🎯 All runs completed successfully.")
     print(f"📁 Results saved under: {OUTPUT_FOLDER}")
+

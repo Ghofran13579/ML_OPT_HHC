@@ -7,13 +7,14 @@ import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import traceback
-import json
 import time
+import json
+
 # =========================
 # PATHS
 # =========================
 INPUT_FOLDER  = r"C:\Users\Ghofran MASSAOUDI\Desktop\output_equitable_Correct_stucture"
-OUTPUT_FOLDER = r"C:\Users\Ghofran MASSAOUDI\Desktop\Q-Learnung_NCRO_PE_Based"
+OUTPUT_FOLDER = r"C:\Users\Ghofran MASSAOUDI\Desktop\Q-Learnung_NCRO_merged-reward_Based"
 os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
 # =========================
@@ -506,7 +507,7 @@ def enforce_and_score_one_nurse_CORRECTED(df, nurse_id, patient_sequence, csv_na
     # Service times (scaled)
     s = np.zeros(J + 2)
     for i in range(1, J + 1):
-        s[i] = SERVICE_SCALE * _service_time(df, patient_sequence[i - 1])
+        s[i] = _service_time(df, patient_sequence[i - 1])
     
     # Timeline calculation
     a, t, endt, work_n, OT_n, time_viol = _timeline_and_overtime_with_arrival(J, Tn, s, Ln)
@@ -578,23 +579,23 @@ def evaluate_solution_CORRECTED(solution: List[int], df: pd.DataFrame,
     
     # Moderate overtime penalties
     if fam == "c":      
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     elif fam == "r":
-        DN_PER_TIME = 0.5  # Keep moderate for random
+        DN_PER_TIME = 1.0  # Keep moderate for random
     elif fam == "rc":
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     else:               
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     
     # Service scaling (use near-full service times)
     if fam == "c":
-        SERVICE_SCALE = 0.95
+        SERVICE_SCALE = 1.0
     elif fam == "r":
-        SERVICE_SCALE = 0.98  # 98% of actual service time
+        SERVICE_SCALE = 1.0  # 98% of actual service time
     elif fam == "rc":
-        SERVICE_SCALE = 0.96
+        SERVICE_SCALE = 1.0
     else:
-        SERVICE_SCALE = 0.95
+        SERVICE_SCALE = 1.0
     
     # Patient coverage penalty
     penalties_global = 0.0
@@ -1186,66 +1187,105 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
     Q_table = np.zeros((len(ACTIONS), len(ACTIONS)))   # state = previous action
     QL_ALPHA, QL_GAMMA, QL_EPSILON = 0.3, 0.9, 0.8
     prev_action = 0  # start assuming 'wall' was last operator
-    op_rewards = {a: [] for a in ACTIONS}
-# --- Tag children with their operator for tracking ---
-    def compute_reward(parents, children, action_label=""):
+    def compute_reward(parents, children):
         """
-        Reward based on Potential Energy (PE) improvement.
-        Reward = max(0, mean(PE_parents) - mean(PE_children))
-        (Lower PE means better solutions.)
+        Hybrid reward:
+        R = ΔHV + dominance_score   if ΔHV > 0
+        R = ΔHV                     if ΔHV < 0 (penalty)
+        R = 0                      if ΔHV == 0 (no learning signal)
         """
         if not parents or not children:
             return 0.0
-
+    
+        # --- HV Reward ---
         try:
-            pe_parents = np.mean([p.PE for p in parents])
-            pe_children = np.mean([c.PE for c in children])
-            delta_pe = pe_children - pe_parents
-            reward = max(0.0, -delta_pe)  # positive only when children improved
+            pareto_par = np.array([[p.obj[0], p.obj[1], -p.obj[2]] for p in parents])
+            pareto_child = np.array([[c.obj[0], c.obj[1], -c.obj[2]] for c in children])
+    
+            hv_calc = Hypervolume()
+            pareto_ref = np.vstack([pareto_par, pareto_child])
+    
+            HV_par = hv_calc.hypervolume(pareto_par, pareto_ref, 3)
+            HV_child = hv_calc.hypervolume(pareto_child, pareto_ref, 3)
+    
+            delta_HV = HV_child - HV_par
+        except:
+            delta_HV = 0.0
+    
+        # --- Dominance Reward ---
+        def dom_vec(m): return (m.obj[0], m.obj[1], -m.obj[2])
+    
+        def dominates(a, b):
+            av, bv = dom_vec(a), dom_vec(b)
+            better = False
+            for ai, bi in zip(av, bv):
+                if ai > bi:
+                    return False
+                if ai < bi:
+                    better = True
+            return better
+    
+        P = list(parents)
+        dom_score = 0.0
+        cnt = 0
+    
+        for child in children:
+            pA, pB = getattr(child, "parents", (None, None))
+            cand = []
+            if pA is not None and 0 <= pA < len(P): cand.append(P[pA])
+            if pB is not None and 0 <= pB < len(P): cand.append(P[pB])
+            if not cand: cand = P
+    
+            if any(dominates(child, par) for par in cand):
+                dom_score += 1.0
+            cnt += 1
+    
+        dom_score = dom_score / max(1, cnt)
+    
+        # === Final Hybrid Reward ===
+        if delta_HV > 0:
+            return delta_HV + dom_score
+    
+        if delta_HV < 0:
+            return delta_HV  # penalty
+    
+        return 0.0  # no improvement, no punishment
+                    # no change → zero
 
-        except Exception as e:
-            print(f"⚠️ PE reward computation error ({action_label}): {e}")
-            reward = 0.0
-
-        return reward
-
-
-
- # === Q-LEARNING MAIN LOOP (one operator per iteration + Q-table tracking) ===    
+  # === Q-LEARNING MAIN LOOP ===
     while it < MAX_ITERS and FE < FELIMIT:
         it += 1
-    
-        # Select operator (ε-greedy from previous operator as state)
+        
+        # ε-greedy operator selection
         state = prev_action
         if random.random() < QL_EPSILON:
             action_idx = random.randint(0, len(ACTIONS) - 1)
         else:
-            action_idx = int(np.argmin(Q_table[state]))
+            action_idx = int(np.argmax(Q_table[state]))
         action = ACTIONS[action_idx]
-    
+        
+        # ✅ Snapshot parents before creating children
         parents_snapshot = pop[:]
+    
+        # 3️⃣ --- Stage 1: create exactly POP_SIZE offspring Q ---
         Q = []
-    
-        # === Hybrid CRO mechanism + Q-learning control ===
         for _ in range(POP_SIZE):
-            if random.random() < MOLE_COLL and len(pop) >= 2:
-                # --- Bimolecular ---
-                p1, p2 = random.sample(pop, 2)
     
-                # Guided by Q-learning
+            # --- Intermolecular or unimolecular decision (classical NCRO) ---
+            if random.random() < MOLE_COLL and len(pop) >= 2:
+                p1, p2 = random.sample(pop, 2)
+                #  Use Q-learning action when possible
                 if action == "syn" or ((p1.KE <= BETA) and (p2.KE <= BETA)):
                     child = op_syn(p1, p2, df)
                     child.parents = (pop.index(p1), pop.index(p2))
                     Q.append(child)
-    
                 elif action == "inter":
                     c1, c2 = op_inter(p1, p2, df)
                     c1.parents = (pop.index(p1), pop.index(p2))
                     c2.parents = (pop.index(p1), pop.index(p2))
                     Q.extend([c1, c2])
-    
                 else:
-                    # fallback to wall/dec based on energy
+                    # fallback to wall or dec based on ALPHA rule
                     p = random.choice([p1, p2])
                     if (p.NumHit - p.MinHit) > ALPHA and len(p.structure) > 2:
                         c1, c2 = op_dec(p, df)
@@ -1256,9 +1296,8 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
                         c = op_wall(p, df)
                         c.parents = (pop.index(p), None)
                         Q.append(c)
-    
             else:
-                # --- Unimolecular ---
+                # --- Unimolecular case ---
                 p = random.choice(pop)
                 if (p.NumHit - p.MinHit) > ALPHA and len(p.structure) > 2 and action == "dec":
                     c1, c2 = op_dec(p, df)
@@ -1270,6 +1309,7 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
                     c.parents = (pop.index(p), None)
                     Q.append(c)
                 else:
+                    # fallback: random operator
                     c = op_wall(p, df)
                     c.parents = (pop.index(p), None)
                     Q.append(c)
@@ -1279,6 +1319,7 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
                 break
     
         FE += len(Q)
+    
         # 4️⃣ --- Stage 2: assign Rank, CD, PE on P ∪ Q ---
         pool = pop + Q
         assign_rank_cd_pe(pool)
@@ -1381,23 +1422,21 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
         pop_extended = pop + Q
         assign_rank_cd_pe(pop_extended)
         pop = sorted(pop_extended, key=lambda m: (m.Rank, -m.CD))[:POP_SIZE]
-        # ✅ Compute reward using PE difference (children - parents)
-        reward = compute_reward(parents_snapshot, Q, action_label=action)
-        op_rewards[action].append(reward)
-        # --- Q-learning update (temporal) ---
+        
+        # ✅ Compute reward using the real parents (before generation)
+        reward = compute_reward(parents=parents_snapshot, children=Q)
+                
+        # Q-table update
         next_state = action_idx
         Q_table[state, action_idx] += QL_ALPHA * (
-            reward + QL_GAMMA * np.min(Q_table[next_state]) - Q_table[state, action_idx]
+            reward + QL_GAMMA * np.max(Q_table[next_state]) - Q_table[state, action_idx]
         )
-
-        # --- Move forward in the temporal chain ---
         prev_action = next_state
 
-        # --- Simple progress log ---
+        new_fit = np.mean([fitness(m) for m in pop])
         if it % 10 == 0:
-            mean_fit = np.mean([fitness(m) for m in pop])
-            print(f"Iter {it:03d} | action={action:<5} | reward={reward:+.3f} "
-                  f"| mean_fit={mean_fit:.3f} | ε={QL_EPSILON:.3f}")
+            print(f"Iter {it:03d} | act={action:<5} | reward={reward:+.4f} "
+                  f"| mean_fit={new_fit:.3f} | ε={QL_EPSILON:.3f}")
 
     # ===== Final reporting =====
     rows = []
@@ -1462,7 +1501,7 @@ def assign_rank_cd_pe(pool: List[Molecule]) -> None:
         m.CD = float(CD[i])
         m.PE = float(m.Rank + math.exp(-max(0.0, m.CD)))
 # =========================
-# SMART 5-INSTANCE TEST EXECUTION
+# SIMPLE SINGLE-RUN EXECUTION (no checkpoint, no multi-folder)
 # =========================
 NUM_RUNS = 10   # ← Change to 10 if you want 10 runs
 CHECKPOINT_FILE = Path(OUTPUT_FOLDER) / "ncro_checkpoint.json"
@@ -1495,7 +1534,8 @@ if __name__ == "__main__":
     all_files = sorted(Path(INPUT_FOLDER).glob("*.csv"))
 
     # 🔍 Run only the first instance (e.g., c101)
-    all_files = all_files[:1]
+    all_files = all_files[:1]  # this keeps only the first CSV file found
+
     if not all_files:
         print("⚠️ No CSV files found in INPUT_FOLDER.")
         raise SystemExit
@@ -1551,7 +1591,7 @@ if __name__ == "__main__":
                 df_out = run_ncro_one_file(f, pat_count=25)
 
                 # === Safe write (atomic) ===
-                df_out.to_csv(tmp_path, sep=",", float_format="%.6f", index=False)
+                df_out.to_csv(tmp_path, sep=";", float_format="%.6f", index=False)
                 tmp_path.replace(out_path)
 
                 hv_value = float(df_out["HV"].iloc[0]) if "HV" in df_out.columns else float("nan")
