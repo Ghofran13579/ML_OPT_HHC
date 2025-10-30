@@ -7,7 +7,8 @@ import numpy as np
 from pathlib import Path
 from typing import List, Tuple, Dict, Any, Optional
 import traceback
-
+import json
+import time
 # =========================
 # PATHS
 # =========================
@@ -1219,7 +1220,7 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
         if random.random() < QL_EPSILON:
             action_idx = random.randint(0, len(ACTIONS) - 1)
         else:
-            action_idx = int(np.argmax(Q_table[state]))
+            action_idx = int(np.argmin(Q_table[state]))
         action = ACTIONS[action_idx]
     
         parents_snapshot = pop[:]
@@ -1386,7 +1387,7 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
         # --- Q-learning update (temporal) ---
         next_state = action_idx
         Q_table[state, action_idx] += QL_ALPHA * (
-            reward + QL_GAMMA * np.max(Q_table[next_state]) - Q_table[state, action_idx]
+            reward + QL_GAMMA * np.min(Q_table[next_state]) - Q_table[state, action_idx]
         )
 
         # --- Move forward in the temporal chain ---
@@ -1466,64 +1467,108 @@ def assign_rank_cd_pe(pool: List[Molecule]) -> None:
 # =========================
 # SMART 5-INSTANCE TEST EXECUTION
 # =========================
+NUM_RUNS = 10   # ← Change to 10 if you want 10 runs
+CHECKPOINT_FILE = Path(OUTPUT_FOLDER) / "ncro_checkpoint.json"
+
+def save_checkpoint(run_id, file_name, completed=False):
+    """Save progress state for resume after crash/power loss."""
+    data = {
+        "run_id": run_id,
+        "file_name": file_name,
+        "completed": completed,
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with open(CHECKPOINT_FILE, "w") as f:
+        json.dump(data, f)
+
+def load_checkpoint():
+    if CHECKPOINT_FILE.exists():
+        with open(CHECKPOINT_FILE, "r") as f:
+            return json.load(f)
+    return None
+
+def clear_checkpoint():
+    if CHECKPOINT_FILE.exists():
+        CHECKPOINT_FILE.unlink()
+
+# =========================
+# MAIN EXECUTION
+# =========================
 if __name__ == "__main__":
     all_files = sorted(Path(INPUT_FOLDER).glob("*.csv"))
     if not all_files:
         print("⚠️ No CSV files found in INPUT_FOLDER.")
         raise SystemExit
 
-    # Group files by category
-    fam_groups = {"c": [], "r": [], "rc": [], "other": []}
-    for f in all_files:
-        name = f.name.lower()
-        if name.startswith("rc"):
-            fam_groups["rc"].append(f)
-        elif name.startswith("c"):
-            fam_groups["c"].append(f)
-        elif name.startswith("r"):
-            fam_groups["r"].append(f)
-        else:
-            fam_groups["other"].append(f)
+    print(f"Found {len(all_files)} instance files to process.\n")
 
-    # Randomly choose up to 2 from each non-empty family, capped at 5 total
-    selected_files = []
-    random.seed(42)
-    for fam in ["c", "r", "rc"]:
-        random.shuffle(fam_groups[fam])
-        selected_files.extend(fam_groups[fam][:2])
-    selected_files = selected_files[:5]
+    checkpoint = load_checkpoint()
+    start_run = 1
+    start_file_idx = 0
 
-    print(f"🚀 Starting Q-Learning NCRO single-pass test on {len(selected_files)} representative instances\n")
+    # === Resume point detection ===
+    if checkpoint:
+        print(f"🔄 Resuming from checkpoint: {checkpoint}")
+        start_run = checkpoint.get("run_id", 1)
+        last_file = checkpoint.get("file_name", None)
+        if last_file:
+            for i, f in enumerate(all_files):
+                if f.name == last_file:
+                    start_file_idx = i
+                    break
+    else:
+        print("🚀 Starting fresh multi-run experiment.")
 
-    random.seed(42)
-    np.random.seed(42)
+    # === Main loop ===
+    for run_id in range(start_run, NUM_RUNS + 1):
+        print(f"\n===============================")
+        print(f"🚀 Starting NCRO Run {run_id} / {NUM_RUNS}")
+        print(f"===============================\n")
 
-    results_summary = []
+        # Per-run output folder
+        run_folder = Path(OUTPUT_FOLDER) / f"Run_{run_id:02d}"
+        run_folder.mkdir(parents=True, exist_ok=True)
 
-    for f in selected_files:
-        try:
-            print(f"⚙️ Processing instance: {f.name}")
-            df_out = run_ncro_one_file(f, pat_count=25)
+        # Controlled randomness per run
+        random.seed(42 + run_id * 111)
+        np.random.seed(42 + run_id * 111)
 
-            out_path = Path(OUTPUT_FOLDER) / f"{f.stem}_RewardTest_QNCRO.csv"
-            df_out.to_csv(out_path, sep=",", float_format="%.6f", index=False)
+        # Continue from the correct file if resuming
+        for fi, f in enumerate(all_files[start_file_idx:], start=start_file_idx):
+            try:
+                out_path = run_folder / f"{f.stem}_Run{run_id:02d}_ncro_results.csv"
+                tmp_path = out_path.with_suffix(".tmp")
 
-            hv_value = float(df_out['HV'].iloc[0]) if 'HV' in df_out.columns else float('nan')
-            print(f"✅ Saved {out_path.name} | HV = {hv_value:.6f}\n")
+                # Skip files already completed
+                if out_path.exists():
+                    print(f"⏭️ Run {run_id}: Skipping {f.name} (already done).")
+                    continue
 
-            results_summary.append({
-                "Instance": f.name,
-                "HV": hv_value
-            })
+                print(f"⚙️  Run {run_id}: Processing {f.name} ...")
+                save_checkpoint(run_id, f.name, completed=False)
 
-        except Exception as e:
-            print(f"❌ Error processing {f.name}: {e}")
-            traceback.print_exc()
-            continue
+                # === Run NCRO optimization ===
+                df_out = run_ncro_one_file(f, pat_count=25)
 
-    # ===== Save summary CSV =====
-    summary_df = pd.DataFrame(results_summary)
-    summary_path = Path(OUTPUT_FOLDER) / "QNCRO_RewardTest_Summary.csv"
-    summary_df.to_csv(summary_path, index=False)
-    print("\n🎯 All selected instance files processed successfully.")
-    print(f"📊 Summary saved: {summary_path}")
+                # === Safe write (atomic) ===
+                df_out.to_csv(tmp_path, sep=",", float_format="%.6f", index=False)
+                tmp_path.replace(out_path)
+
+                hv_value = float(df_out["HV"].iloc[0]) if "HV" in df_out.columns else float("nan")
+                print(f"✅ Run {run_id}: saved {out_path.name} | HV = {hv_value:.6f}\n")
+
+                save_checkpoint(run_id, f.name, completed=True)
+
+            except Exception as e:
+                print(f"❌ Run {run_id}: Error processing {f.name}: {e}")
+                traceback.print_exc()
+                save_checkpoint(run_id, f.name, completed=False)
+                print("💾 Progress saved. You can safely restart later.\n")
+                break  # Pause execution safely on error
+
+        # After finishing this run, clear checkpoint
+        clear_checkpoint()
+        start_file_idx = 0  # reset for next run
+
+    print("\n🎯 All runs completed successfully.")
+    print(f"📁 Results saved under: {OUTPUT_FOLDER}")
