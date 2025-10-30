@@ -506,7 +506,7 @@ def enforce_and_score_one_nurse_CORRECTED(df, nurse_id, patient_sequence, csv_na
     # Service times (scaled)
     s = np.zeros(J + 2)
     for i in range(1, J + 1):
-        s[i] = SERVICE_SCALE * _service_time(df, patient_sequence[i - 1])
+        s[i] = _service_time(df, patient_sequence[i - 1])
     
     # Timeline calculation
     a, t, endt, work_n, OT_n, time_viol = _timeline_and_overtime_with_arrival(J, Tn, s, Ln)
@@ -578,23 +578,23 @@ def evaluate_solution_CORRECTED(solution: List[int], df: pd.DataFrame,
     
     # Moderate overtime penalties
     if fam == "c":      
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     elif fam == "r":
-        DN_PER_TIME = 0.5  # Keep moderate for random
+        DN_PER_TIME = 1.0  # Keep moderate for random
     elif fam == "rc":
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     else:               
-        DN_PER_TIME = 0.5
+        DN_PER_TIME = 1.0
     
     # Service scaling (use near-full service times)
     if fam == "c":
-        SERVICE_SCALE = 0.95
+        SERVICE_SCALE = 1.0
     elif fam == "r":
-        SERVICE_SCALE = 0.98  # 98% of actual service time
+        SERVICE_SCALE = 1.0  # 98% of actual service time
     elif fam == "rc":
-        SERVICE_SCALE = 0.96
+        SERVICE_SCALE = 1.0
     else:
-        SERVICE_SCALE = 0.95
+        SERVICE_SCALE = 1.0
     
     # Patient coverage penalty
     penalties_global = 0.0
@@ -1184,30 +1184,44 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
     # === Q-LEARNING PARAMETERS (Operator Selection) ===
     ACTIONS = ["wall", "dec", "inter", "syn"]          # available CRO reactions
     Q_table = np.zeros((len(ACTIONS), len(ACTIONS)))   # state = previous action
-    QL_ALPHA, QL_GAMMA, QL_EPSILON = 0.3, 0.9, 0.4
+    QL_ALPHA, QL_GAMMA, QL_EPSILON = 0.3, 0.9, 0.8
     prev_action = 0  # start assuming 'wall' was last operator
     op_rewards = {a: [] for a in ACTIONS}
 # --- Tag children with their operator for tracking ---
     def compute_reward(parents, children, action_label=""):
         """
-        Reward based on Potential Energy (PE) improvement.
-        Reward = max(0, mean(PE_parents) - mean(PE_children))
-        (Lower PE means better solutions.)
+        PE-based reward:
+        reward = max(0, -(min(PE_child - PE_parent)))
+        => positive only if at least one child has lower PE than its parent
         """
         if not parents or not children:
             return 0.0
-
-        try:
-            pe_parents = np.mean([p.PE for p in parents])
-            pe_children = np.mean([c.PE for c in children])
-            delta_pe = pe_children - pe_parents
-            reward = max(0.0, -delta_pe)  # positive only when children improved
-
-        except Exception as e:
-            print(f"⚠️ PE reward computation error ({action_label}): {e}")
-            reward = 0.0
-
+    
+        gaps = []
+    
+        for c in children:
+            pA, pB = c.parents  # we stored indices in pop before
+            # pick only the first valid parent reference
+            if pA is not None and pA < len(parents):
+                parent_pe = parents[pA].PE
+            elif pB is not None and pB < len(parents):
+                parent_pe = parents[pB].PE
+            else:
+                continue
+    
+            gaps.append(c.PE - parent_pe)
+    
+        if not gaps:
+            return 0.0
+    
+        # we want the minimum gap (best improvement)
+        best_gap = min(gaps)  # most negative is best improvement
+    
+        # convert to positive reward when children improve
+        reward = max(0.0, -best_gap)
+    
         return reward
+
 
 
 
@@ -1496,6 +1510,10 @@ def clear_checkpoint():
 # =========================
 if __name__ == "__main__":
     all_files = sorted(Path(INPUT_FOLDER).glob("*.csv"))
+
+    # 🔍 Run only the first instance (e.g., c101)
+    all_files = all_files[:1]  # this keeps only the first CSV file found
+
     if not all_files:
         print("⚠️ No CSV files found in INPUT_FOLDER.")
         raise SystemExit
