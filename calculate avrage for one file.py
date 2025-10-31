@@ -5,7 +5,7 @@ import pandas as pd
 # ==========================
 # CONFIGURATION
 # ==========================
-ROOT_DIR = r"C:\Users\Ghofran MASSAOUDI\Desktop\Q-Learnung_NCRO_PE_Based_test"  # Folder containing run1...run10
+ROOT_DIR = r"C:\Users\Ghofran MASSAOUDI\Desktop\Q-Learnung_NCRO_HV_Based-test"  # Folder containing run1...run10
 OUTPUT_CSV = r"C:\Users\Ghofran MASSAOUDI\Desktop\HV_average_SetTest.csv"
 VALID_EXTENSIONS = [".csv", ".txt"]
 HV_PATTERN = re.compile(r'\bHV\s*[:=]\s*([0-9]*\.?[0-9]+)', re.IGNORECASE)
@@ -19,10 +19,18 @@ def extract_hv_from_file(file_path):
     try:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".csv":
-            df = pd.read_csv(file_path)
+            df = pd.read_csv(file_path, dtype=str)
             hv_cols = [c for c in df.columns if "hv" in c.lower()]
             if hv_cols and not df.empty:
-                return float(df[hv_cols[0]].dropna().iloc[0])
+                hv_str = df[hv_cols[0]].dropna().iloc[0]
+
+                parts = re.split(r'[;,]', hv_str)
+                for part in reversed(parts):
+                    try:
+                        return float(part.strip())
+                    except ValueError:
+                        continue
+
         else:  # TXT
             with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
                 text = f.read()
