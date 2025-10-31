@@ -1418,6 +1418,7 @@ def run_ncro_one_file(csv_path: Path, pat_count: int) -> pd.DataFrame:
             reward + QL_GAMMA * np.max(Q_table[next_state]) - Q_table[state, action_idx]
         )
         prev_action = next_state
+
         new_fit = np.mean([fitness(m) for m in pop])
         if it % 10 == 0:
             print(f"Iter {it:03d} | act={action:<5} | reward={reward:+.4f} "
